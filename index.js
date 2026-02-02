@@ -1,102 +1,110 @@
 const { WebcastPushConnection } = require('tiktok-live-connector');
 const axios = require('axios');
+const http = require('http');
 
-// --- الإعدادات من متغيرات البيئة ---
-const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME || "talalmsa455";
+// ========== الإعدادات ==========
+const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.error("❌ يرجى تعيين TELEGRAM_TOKEN و TELEGRAM_CHAT_ID في Railway Variables");
+if (!TIKTOK_USERNAME || !TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.error('❌ خطأ: المتغيرات البيئية غير مكتملة');
+    console.error('المطلوب: TIKTOK_USERNAME, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID');
     process.exit(1);
 }
 
-// --- المتغيرات ---
-let stats = {
-    highestHundred: 0,
-    maxViewers: 0, 
+// ========== المتغيرات ==========
+const stats = {
+    isLive: false,
+    startTime: null,
+    maxViewers: 0,
     totalLikes: 0,
     totalGifts: 0,
     totalDiamonds: 0,
-    topGifter: { name: "لا يوجد", diamonds: 0 },
-    isLive: false,
-    lastNotification: 0,
-    startTime: null
+    topGifter: { name: 'لا يوجد', diamonds: 0 },
+    highestHundred: 0,
+    lastNotification: 0
 };
 
 let tiktokConnection = null;
 let reconnectTimer = null;
 let isConnecting = false;
 
-// --- نظام إرسال Telegram بسيط وفعال ---
-const telegramQueue = [];
-let isSending = false;
+// ========== نظام Telegram Queue ==========
+const messageQueue = [];
+let isProcessingQueue = false;
 
-async function processTelegramQueue() {
-    if (isSending || telegramQueue.length === 0) return;
-    isSending = true;
+async function processQueue() {
+    if (isProcessingQueue || messageQueue.length === 0) return;
+    isProcessingQueue = true;
     
-    const { text, resolve, reject } = telegramQueue.shift();
+    const { text, resolve, reject } = messageQueue.shift();
     
     try {
-        await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-            chat_id: TELEGRAM_CHAT_ID,
-            text: text,
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-        }, { timeout: 10000 });
-        
-        console.log("✅ تم إرسال الرسالة");
+        await axios.post(
+            `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+            {
+                chat_id: TELEGRAM_CHAT_ID,
+                text: text,
+                parse_mode: 'HTML',
+                disable_web_page_preview: true
+            },
+            { timeout: 10000 }
+        );
+        console.log('✅ تم الإرسال إلى Telegram');
         resolve();
-    } catch (err) {
-        console.error("❌ خطأ في الإرسال:", err.response?.data?.description || err.message);
-        // إعادة المحاولة بعد 5 ثواني إذا كان خطأ مؤقتاً
-        if (telegramQueue.length < 5) { // تجنب الازدحام
-            setTimeout(() => {
-                telegramQueue.unshift({ text, resolve, reject });
-                processTelegramQueue();
-            }, 5000);
-        } else {
-            reject(err);
+    } catch (error) {
+        console.error('❌ فشل الإرسال:', error.message);
+        if (messageQueue.length < 10) {
+            messageQueue.unshift({ text, resolve, reject });
         }
     } finally {
-        isSending = false;
-        // Rate limit: انتظار 1.5 ثانية بين الرسائل
-        setTimeout(processTelegramQueue, 1500);
+        isProcessingQueue = false;
+        setTimeout(processQueue, 2000); // Rate limiting
     }
 }
 
 function sendToTelegram(text) {
     return new Promise((resolve, reject) => {
-        telegramQueue.push({ text, resolve, reject });
-        processTelegramQueue();
+        messageQueue.push({ text, resolve, reject });
+        processQueue();
     });
 }
 
-// --- تصفير الإحصائيات ---
+// ========== أدوات مساعدة ==========
 function resetStats() {
-    stats = {
-        highestHundred: 0,
-        maxViewers: 0,
-        totalLikes: 0,
-        totalGifts: 0,
-        totalDiamonds: 0,
-        topGifter: { name: "لا يوجد", diamonds: 0 },
-        isLive: true,
-        lastNotification: 0,
-        startTime: new Date()
-    };
+    stats.isLive = true;
+    stats.startTime = new Date();
+    stats.maxViewers = 0;
+    stats.totalLikes = 0;
+    stats.totalGifts = 0;
+    stats.totalDiamonds = 0;
+    stats.topGifter = { name: 'لا يوجد', diamonds: 0 };
+    stats.highestHundred = 0;
+    stats.lastNotification = 0;
 }
 
-// --- الاتصال الرئيسي ---
-async function startMonitoring() {
+function getBaghdadTime() {
+    const now = new Date();
+    return new Intl.DateTimeFormat('ar-IQ', {
+        timeZone: 'Asia/Baghdad',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true
+    }).format(now);
+}
+
+// ========== TikTok Connection ==========
+async function connectToTikTok() {
     if (isConnecting || stats.isLive) return;
     isConnecting = true;
     
-    console.log(`🔌 محاولة الاتصال بـ TikTok: ${TIKTOK_USERNAME}`);
-
+    console.log(`🔌 الاتصال بـ TikTok: ${TIKTOK_USERNAME}`);
+    
     try {
-        // إغلاق الاتصال القديم إن وجد
         if (tiktokConnection) {
             try { tiktokConnection.disconnect(); } catch(e) {}
         }
@@ -105,156 +113,122 @@ async function startMonitoring() {
             processInitialData: true,
             enableWebsocketUpgrade: true,
             clientParams: {
-                app_language: "ar-SA",
-                device_platform: "web",
-                browser_name: "Chrome",
-                browser_version: "120.0.0.0"
+                app_language: 'ar-SA',
+                device_platform: 'web'
             }
         });
 
-        // ✅ بدء الاتصال
+        // ✅ بدء البث
         tiktokConnection.on('connected', () => {
-            console.log(`✅ متصل ببث: ${TIKTOK_USERNAME}`);
+            console.log('✅ متصل بالبث');
             resetStats();
             
             sendToTelegram(
-                `🚀 <b>بدأ البث المباشر الآن!</b>\n` +
+                `🚀 <b>بدأ البث المباشر!</b>\n\n` +
                 `👤 الحساب: <code>${TIKTOK_USERNAME}</code>\n` +
                 `🔗 <a href="https://www.tiktok.com/@${TIKTOK_USERNAME}/live">رابط البث</a>\n` +
-                `🖥️ الخادم: Railway.app`
+                `⏰ ${getBaghdadTime()}`
             );
         });
 
-        // 👥 مراقبة المشاهدين
+        // 👥 مشاهدين
         tiktokConnection.on('roomUser', (data) => {
             if (!data?.viewerCount) return;
             
             const viewers = data.viewerCount;
             if (viewers > stats.maxViewers) stats.maxViewers = viewers;
 
-            const currentHundred = Math.floor(viewers / 100) * 100;
+            const hundred = Math.floor(viewers / 100) * 100;
             const now = Date.now();
             
-            // إشعار كل 100 مشاهد (مع فاصل 3 دقائق)
-            if (currentHundred >= 100 && 
-                currentHundred > stats.highestHundred && 
-                (now - stats.lastNotification > 180000)) {
-                
-                stats.highestHundred = currentHundred;
+            if (hundred >= 100 && hundred > stats.highestHundred && (now - stats.lastNotification > 120000)) {
+                stats.highestHundred = hundred;
                 stats.lastNotification = now;
-                
                 sendToTelegram(
-                    `🎊 <b>إنجاز جديد!</b>\n` +
-                    `👁️ المشاهدين: <b>${viewers.toLocaleString()}</b>\n` +
-                    `📈 تجاوزنا عتبة: <b>${currentHundred}</b>\n` +
-                    `⏰ ${new Date().toLocaleTimeString('ar-SA')}`
+                    `🎊 <b>${hundred} مشاهد!</b>\n` +
+                    `👁️ الحالي: ${viewers.toLocaleString()}`
                 );
             }
         });
 
-        // ❤️ الإعجابات
+        // ❤️ إعجابات
         tiktokConnection.on('like', (data) => {
             if (data?.totalLikeCount) stats.totalLikes = data.totalLikeCount;
         });
 
-        // 🎁 الهدايا
+        // 🎁 هدايا
         tiktokConnection.on('gift', (data) => {
             if (!data?.repeatCount) return;
             
-            const giftCount = data.repeatCount;
-            const diamondValue = (data.diamondCount || 0) * giftCount;
+            const count = data.repeatCount;
+            const value = (data.diamondCount || 0) * count;
             
-            stats.totalGifts += giftCount;
-            stats.totalDiamonds += diamondValue;
+            stats.totalGifts += count;
+            stats.totalDiamonds += value;
             
-            if (diamondValue > stats.topGifter.diamonds) {
+            if (value > stats.topGifter.diamonds) {
                 stats.topGifter = {
-                    name: data.nickname || data.uniqueId || "مجهول",
-                    diamonds: diamondValue
+                    name: data.nickname || data.uniqueId || 'مجهول',
+                    diamonds: value
                 };
             }
         });
 
-        // ❌ انقطاع الاتصال
+        // ❌ نهاية البث
         tiktokConnection.on('disconnected', () => {
-            console.log('🔌 انقطع الاتصال');
-            if (stats.isLive) {
-                stats.isLive = false;
-                sendEndNotification();
-            }
+            if (!stats.isLive) return;
+            console.log('🔌 انتهى البث');
+            stats.isLive = false;
+            
+            const duration = stats.startTime ? 
+                Math.floor((Date.now() - stats.startTime) / 60000) : 0;
+            
+            sendToTelegram(
+                `🏁 <b>انتهى البث</b>\n\n` +
+                `⏱️ المدة: ${duration} دقيقة\n` +
+                `🏆 أعلى مشاهدة: ${stats.maxViewers.toLocaleString()}\n` +
+                `💖 إعجابات: ${stats.totalLikes.toLocaleString()}\n` +
+                `🎁 هدايا: ${stats.totalGifts} (${stats.totalDiamonds}💎)\n` +
+                `🌟 أكبر داعم: ${stats.topGifter.name}`
+            );
+            
             scheduleReconnect(30000);
         });
 
         // ⚠️ أخطاء
         tiktokConnection.on('error', (err) => {
-            console.error('⚠️ خطأ في TikTok:', err.message);
+            console.error('⚠️ خطأ:', err.message);
         });
 
         await tiktokConnection.connect();
         
-    } catch (err) {
-        console.error(`❌ فشل الاتصال: ${err.message}`);
-        // في Railway، نحاول مجدداً بسرعة أكبر من HF
-        scheduleReconnect(45000);
+    } catch (error) {
+        console.error(`❌ فشل: ${error.message}`);
+        scheduleReconnect(60000);
     } finally {
         isConnecting = false;
     }
 }
 
-// --- إشعار النهاية ---
-function sendEndNotification() {
-    const now = new Date();
-    const options = { 
-        timeZone: 'Asia/Baghdad', 
-        year: 'numeric', month: '2-digit', day: '2-digit', 
-        hour: '2-digit', minute: '2-digit', hour12: true 
-    };
-    
-    const formatter = new Intl.DateTimeFormat('ar-IQ', options);
-    const parts = formatter.formatToParts(now);
-    
-    const dateStr = `${parts.find(p => p.type === 'day').value}/${parts.find(p => p.type === 'month').value}/${parts.find(p => p.type === 'year').value}`;
-    const timeStr = `${parts.find(p => p.type === 'hour').value}:${parts.find(p => p.type === 'minute').value} ${parts.find(p => p.type === 'dayPeriod').value}`;
-
-    const duration = stats.startTime ? 
-        Math.floor((new Date() - stats.startTime) / 60000) + ' دقيقة' : 
-        'غير معروف';
-
-    sendToTelegram(
-        `🏁 <b>انتهى البث المباشر</b>\n\n` +
-        `👤 الحساب: <code>${TIKTOK_USERNAME}</code>\n` +
-        `📅 التاريخ: ${dateStr}\n` +
-        `⏰ الوقت: ${timeStr}\n` +
-        `⏱️ المدة: ${duration}\n` +
-        `🏆 أعلى مشاهدة: <b>${stats.maxViewers.toLocaleString()}</b>\n` +
-        `💖 إجمالي الإعجابات: <b>${stats.totalLikes.toLocaleString()}</b>\n` +
-        `🎁 عدد الهدايا: <b>${stats.totalGifts.toLocaleString()}</b>\n` +
-        `💎 قيمة الهدايا: <b>${stats.totalDiamonds.toLocaleString()}</b> دولار\n` +
-        `🌟 أكبر داعم: <b>${stats.topGifter.name}</b> (${stats.topGifter.diamonds.toLocaleString()} 💎)`
-    );
-}
-
 function scheduleReconnect(delay) {
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    console.log(`🔄 إعادة المحاولة بعد ${delay/1000} ثانية...`);
-    reconnectTimer = setTimeout(() => {
-        if (!stats.isLive) startMonitoring();
-    }, delay);
+    console.log(`🔄 إعادة المحاولة بعد ${delay/1000}ث...`);
+    reconnectTimer = setTimeout(connectToTikTok, delay);
 }
 
-// --- Health Check (مطلوب لـ Railway) ---
-const http = require('http');
+// ========== Health Check Server ==========
+const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-        status: 'running',
-        tiktok: stats.isLive ? 'connected' : 'disconnected',
-        user: TIKTOK_USERNAME,
-        viewers: stats.maxViewers,
-        uptime: Math.floor(process.uptime() / 60) + ' دقيقة'
+        status: 'active',
+        tiktok_connected: stats.isLive,
+        username: TIKTOK_USERNAME,
+        max_viewers: stats.maxViewers,
+        uptime_minutes: Math.floor(process.uptime() / 60),
+        timestamp: new Date().toISOString()
     }));
-}).listen(process.env.PORT || 3000, () => {
-    console.log('🚀 البوت يعمل على Railway');
-    console.log(`📊 مراقبة: ${TIKTOK_USERNAME}`);
-    startMonitoring();
+}).listen(PORT, () => {
+    console.log(`🚀 السيرفر يعمل على المنفذ ${PORT}`);
+    connectToTikTok();
 });
